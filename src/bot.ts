@@ -1,40 +1,36 @@
-import 'dotenv/config'
+import { config } from './config'
 import TelegramBot from 'node-telegram-bot-api'
-import { registerImageHandler } from "./handlers/image";
+import { registerScrapeHandler } from './handlers/scrape'
+import { registerStatusHandler } from './handlers/status'
+import { registerAdminHandler } from './handlers/admin'
 
 import dns from 'dns'
-
 dns.setDefaultResultOrder('ipv4first')
 
-// validate env
-const token = process.env.BOT_TOKEN
-if (!token) throw new Error('BOT_TOKEN is missing')
-
-const bot = new TelegramBot(token, {
+const bot = new TelegramBot(config.botToken, {
   polling: {
-    interval: 300, // faster response
+    interval: 300,
     autoStart: true,
   },
 })
 
 // handlers
 bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, 'Bot is running locally 🚀')
+  bot.sendMessage(msg.chat.id, 'Bot is running 🚀\n\nCommands:\n/scrape - Start scraping\n/status - View progress\n/add <id> <label> - Add initiative\n/remove <id> - Remove initiative')
 })
 
-bot.on('message', (msg) => {
-  if (msg.text && msg.text !== '/start') {
-    bot.sendMessage(msg.chat.id, `Echo: ${msg.text}`)
-  }
-})
+registerScrapeHandler(bot)
+registerStatusHandler(bot)
+registerAdminHandler(bot)
 
-// error handling (important)
 bot.on('polling_error', (error: any) => {
-  if (error.code === 'EFATAL') return // ignore startup noise
-
+  if (error.code === 'EFATAL' || error.cause?.code === 'ETIMEDOUT') return
   console.error('Polling error:', error.message)
 })
 
-registerImageHandler(bot)
+process.on('uncaughtException', (err: any) => {
+  if (err.cause?.code === 'ETIMEDOUT' || err.code === 'EFATAL') return
+  console.error('Uncaught:', err.message)
+})
 
 console.log('Bot started...')
