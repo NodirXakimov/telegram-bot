@@ -77,8 +77,9 @@ export function registerScrapeHandler(bot: TelegramBot) {
       if (scrapeResult.errorMessage) {
         lines.push(`Error: ${scrapeResult.errorMessage}`)
       }
-      if (scrapeResult.stoppedReason === 'expired') {
-        lines.push('\nSend /scrape to continue with next initiative')
+      if (scrapeResult.stoppedReason === 'expired' || scrapeResult.stoppedReason === 'done') {
+        const allDone = scrapeResult.stoppedReason === 'done'
+        if (!allDone) lines.push('\nSend /scrape to continue with next initiative')
       }
 
       await bot.sendMessage(chatId, lines.join('\n'))

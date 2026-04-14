@@ -84,8 +84,8 @@ export async function pickNextInitiative(): Promise<ScrapeState | null> {
   const { data, error } = await supabase
     .from('scrape_state')
     .select('*')
+    .eq('is_initial_done', false)
     .or(`frozen_until.is.null,frozen_until.lt.${now}`)
-    .order('is_initial_done', { ascending: true })
     .order('last_scraped_at', { ascending: true, nullsFirst: true })
     .limit(1)
 

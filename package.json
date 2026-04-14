@@ -1,4 +1,7 @@
 {
+  "scripts": {
+    "start": "npx ts-node src/bot.ts"
+  },
   "dependencies": {
     "@supabase/supabase-js": "^2.103.0",
     "axios": "^1.15.0",
@@ -7,6 +10,8 @@
   },
   "devDependencies": {
     "@types/node": "^25.6.0",
-    "@types/node-telegram-bot-api": "^0.64.14"
+    "@types/node-telegram-bot-api": "^0.64.14",
+    "ts-node": "^10.9.2",
+    "typescript": "^6.0.2"
   }
 }
