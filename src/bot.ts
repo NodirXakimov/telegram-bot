@@ -16,7 +16,7 @@ const bot = new TelegramBot(config.botToken, {
 
 // handlers
 bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, 'Bot is running 🚀\n\nCommands:\n/scrape - Start scraping\n/status - View progress\n/add <id> <label> - Add initiative\n/remove <id> - Remove initiative')
+  bot.sendMessage(msg.chat.id, 'Bot is running 🚀\n\nCommands:\n/scrape - Start scraping\n/status - View progress\n/add <id> <label> - Add initiative\n/remove <id> - Remove initiative\n/resync - Reset incomplete initiatives for re-scrape')
 })
 
 registerScrapeHandler(bot)

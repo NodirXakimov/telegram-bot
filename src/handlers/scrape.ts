@@ -2,7 +2,7 @@ import TelegramBot, { Message } from 'node-telegram-bot-api'
 import { config } from '../config'
 import { fetchCaptcha, fetchInitiativeToken } from '../services/captcha.service'
 import { scrapeWithToken } from '../services/scraper.service'
-import { pickNextInitiative, getScrapedCount } from '../services/supabase.service'
+import { pickNextInitiative, getScrapedCount, getScrapeState } from '../services/supabase.service'
 
 // pending captcha per chat: chatId -> { captchaKey, initiativeId }
 const pendingCaptchas = new Map<number, { captchaKey: string; initiativeId: string }>()
@@ -60,9 +60,15 @@ export function registerScrapeHandler(bot: TelegramBot) {
     try {
       const result = await fetchInitiativeToken(pending.initiativeId, pending.captchaKey, msg.text.trim())
 
-      const scraped = await getScrapedCount(pending.initiativeId)
+      const [scraped, state] = await Promise.all([
+        getScrapedCount(pending.initiativeId),
+        getScrapeState(pending.initiativeId),
+      ])
+      const isGapScan = state && !state.is_initial_done && state.current_page === -1
       await bot.sendMessage(chatId,
-        `Token received. Scraping from page... (${scraped} records in DB)`
+        isGapScan
+          ? `Token received. Gap scan: binary searching for missing pages... (${scraped}/${state?.total_elements ?? '?'} in DB)`
+          : `Token received. Scraping from page ${state?.current_page ?? 0}... (${scraped} records in DB)`
       )
 
       const scrapeResult = await scrapeWithToken(result.token, pending.initiativeId)

@@ -24,7 +24,7 @@ export function registerStatusHandler(bot: TelegramBot) {
     for (const s of states) {
       const scraped = await getScrapedCount(s.initiative_id)
       const total = s.total_elements || '?'
-      const pct = s.total_elements ? Math.round((scraped / s.total_elements) * 100) : '?'
+      const pct = s.total_elements ? Math.floor((scraped / s.total_elements) * 100) : '?'
 
       let status = ''
       if (s.frozen_until) {
@@ -39,6 +39,9 @@ export function registerStatusHandler(bot: TelegramBot) {
         }
       } else if (s.is_initial_done) {
         status = 'initial done'
+      } else if (s.current_page === -1) {
+        const missing = s.total_elements ? s.total_elements - scraped : '?'
+        status = `🔍 gap scan queued (${missing} missing)`
       } else {
         status = `page ${s.current_page}/${s.total_pages || '?'}`
       }
