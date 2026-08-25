@@ -1,6 +1,6 @@
 import TelegramBot, { Message } from 'node-telegram-bot-api'
 import { config } from '../config'
-import { addInitiative, removeInitiative, getAllScrapeStates, getScrapedCount, updateScrapeState } from '../services/supabase.service'
+import { addInitiative, removeInitiative, getAllScrapeStates, getScrapedCounts, updateScrapeState } from '../services/supabase.service'
 
 function isAllowed(msg: Message): boolean {
   if (config.allowedUsers.length === 0) return true
@@ -30,9 +30,10 @@ export function registerAdminHandler(bot: TelegramBot) {
 
   bot.onText(/\/remove (.+)/, async (msg: Message, match: RegExpExecArray | null) => {
     if (!isAllowed(msg)) return
-    if (!match) return
 
-    const id = match[1].trim()
+    const id = match?.[1].trim()
+    if (!id) return
+
     const ok = await removeInitiative(id)
     await bot.sendMessage(msg.chat.id, ok ? `Removed: ${id}` : `Failed to remove`)
   })
@@ -48,26 +49,28 @@ export function registerAdminHandler(bot: TelegramBot) {
 
     const lines: string[] = []
 
+    // Clearing the watermark makes the next run walk every page down to the bottom
+    // instead of stopping once it reaches covered territory — a full re-verify.
+    const counts = await getScrapedCounts(states.map(s => s.initiative_id))
+
     for (const s of states) {
-      if (!s.total_elements) continue
-      const scraped = await getScrapedCount(s.initiative_id)
-      const missing = s.total_elements - scraped
-      if (missing <= 0) continue
+      const scraped = counts.get(s.initiative_id) ?? 0
 
       await updateScrapeState(s.initiative_id, {
-        is_initial_done: false,
-        current_page: -1,
+        coverage_newest: null,
+        catchup_floor: null,
+        catchup_top: null,
         frozen_until: null,
       })
 
       const label = s.label || s.initiative_id.slice(0, 8)
-      lines.push(`${label}: ${scraped}/${s.total_elements} — missing ${missing}, reset to page 0`)
+      lines.push(`${label}: ${scraped}/${s.total_elements || '?'} — full re-verify queued`)
     }
 
-    if (lines.length === 0) {
-      await bot.sendMessage(msg.chat.id, 'All initiatives are complete. Nothing to resync.')
-    } else {
-      await bot.sendMessage(msg.chat.id, `Reset ${lines.length} incomplete initiative(s):\n\n${lines.join('\n')}`)
-    }
+    await bot.sendMessage(msg.chat.id, [
+      `Queued ${lines.length} initiative(s) for full re-verify:`,
+      '',
+      ...lines,
+    ].join('\n'))
   })
 }

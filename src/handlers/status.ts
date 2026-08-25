@@ -1,10 +1,14 @@
 import TelegramBot, { Message } from 'node-telegram-bot-api'
 import { config } from '../config'
-import { getAllScrapeStates, getScrapedCount } from '../services/supabase.service'
+import { getAllScrapeStates, getScrapedCounts } from '../services/supabase.service'
 
 function isAllowed(msg: Message): boolean {
   if (config.allowedUsers.length === 0) return true
   return config.allowedUsers.includes(msg.from?.id ?? 0)
+}
+
+function shortDate(iso: string): string {
+  return iso.slice(0, 16).replace('T', ' ')
 }
 
 export function registerStatusHandler(bot: TelegramBot) {
@@ -19,36 +23,34 @@ export function registerStatusHandler(bot: TelegramBot) {
       return
     }
 
+    const counts = await getScrapedCounts(states.map(s => s.initiative_id))
     const lines: string[] = []
 
-    for (const s of states) {
-      const scraped = await getScrapedCount(s.initiative_id)
+    states.forEach((s) => {
+      const scraped = counts.get(s.initiative_id) ?? 0
       const total = s.total_elements || '?'
       const pct = s.total_elements ? Math.floor((scraped / s.total_elements) * 100) : '?'
 
-      let status = ''
-      if (s.frozen_until) {
-        const frozenTime = new Date(s.frozen_until).getTime()
-        const now = Date.now()
-        if (frozenTime > now) {
-          const mins = Math.ceil((frozenTime - now) / 60000)
-          status = `🥶 frozen (${mins}m left)`
-        } else {
-          const minsSince = Math.floor((now - frozenTime) / 60000)
-          status = `🟢 ready (unfrozen ${minsSince}m ago)`
-        }
-      } else if (s.is_initial_done) {
-        status = 'initial done'
-      } else if (s.current_page === -1) {
-        const missing = s.total_elements ? s.total_elements - scraped : '?'
-        status = `🔍 gap scan queued (${missing} missing)`
+      let status: string
+      const frozenTime = s.frozen_until ? new Date(s.frozen_until).getTime() : 0
+      const now = Date.now()
+
+      if (frozenTime > now) {
+        status = `🥶 frozen (${Math.ceil((frozenTime - now) / 60000)}m left)`
+      } else if (s.catchup_floor) {
+        status = `⏸ resumable — stopped at ${shortDate(s.catchup_floor)}`
+      } else if (!s.is_initial_done) {
+        status = `backfill page ${s.current_page}/${s.total_pages || '?'}`
+      } else if (!s.coverage_newest) {
+        status = '🔍 full re-verify queued'
       } else {
-        status = `page ${s.current_page}/${s.total_pages || '?'}`
+        status = `✅ covered to ${shortDate(s.coverage_newest)}`
       }
 
       const label = s.label || s.initiative_id.slice(0, 8)
-      lines.push(`${label}: ${scraped}/${total} (${pct}%) - ${status}`)
-    }
+      const star = config.priorityInitiatives.includes(s.initiative_id) ? '⭐ ' : ''
+      lines.push(`${star}${label}: ${scraped}/${total} (${pct}%) - ${status}`)
+    })
 
     await bot.sendMessage(chatId, lines.join('\n'))
   })

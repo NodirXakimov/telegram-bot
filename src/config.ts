@@ -17,4 +17,13 @@ export const config = {
     .map(s => s.trim())
     .filter(Boolean)
     .map(Number),
+  // Initiative ids that /scrape prefers, earliest = highest priority.
+  priorityInitiatives: (process.env.PRIORITY_INITIATIVES ?? '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean),
+  // How long a caught-up priority initiative yields its turn to the rotation.
+  priorityCooldownMinutes: Number.isFinite(Number(process.env.PRIORITY_COOLDOWN_MINUTES))
+    ? Number(process.env.PRIORITY_COOLDOWN_MINUTES)
+    : 30,
 }

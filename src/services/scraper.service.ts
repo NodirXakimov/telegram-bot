@@ -1,199 +1,278 @@
 import axios from 'axios'
-import { PageResponse, ScrapeResult, ScrapeState } from '../types'
-import { upsertVotes, updateScrapeState, getScrapeState, getScrapedCount } from './supabase.service'
-
-// Sentinel value stored in current_page to trigger gap scan
-const GAP_SCAN_SENTINEL = -1
-const MAX_PAGES_PER_SESSION = 20
+import { PageResponse, ScrapeResult, Vote } from '../types'
+import { upsertVotes, updateScrapeState, getScrapeState, getNewestVoteDate } from './supabase.service'
+import { withRetry } from './retry'
 
 const BASE_URL = 'https://openbudget.uz'
+const TIMEOUT_MS = 15000
+
+// vote_date has minute precision, so votes sharing the boundary minute can straddle
+// a page edge. After crossing the watermark we fetch this many extra pages.
+const OVERSHOOT_PAGES = 1
+
+// "2026-08-25T06:37:00" — ISO field order means lexicographic compare is chronological.
+function normalizeDate(raw: string): string {
+  return raw.trim().replace(' ', 'T')
+}
+
+function oldestOnPage(content: Vote[]): string | null {
+  let oldest: string | null = null
+  for (const v of content) {
+    const d = normalizeDate(v.voteDate)
+    if (oldest === null || d < oldest) oldest = d
+  }
+  return oldest
+}
+
+function newestOnPage(content: Vote[]): string | null {
+  let newest: string | null = null
+  for (const v of content) {
+    const d = normalizeDate(v.voteDate)
+    if (newest === null || d > newest) newest = d
+  }
+  return newest
+}
+
+interface Session {
+  token: string
+  initiativeId: string
+  pagesFetched: number
+  newRecords: number
+  searchFetches: number
+  totalPages: number
+  totalElements: number
+}
 
 async function fetchPage(token: string, page: number): Promise<PageResponse> {
-  const res = await axios.get(`${BASE_URL}/api/v2/info/votes/${token}`, {
-    params: { page },
-  })
+  // 410/411 are not retried — withRetry treats 4xx as final, so the freeze and
+  // token-expiry paths still fire on the first response.
+  const res = await withRetry(`votes page ${page}`, () => axios.get(
+    `${BASE_URL}/api/v2/info/votes/${token}`,
+    { params: { page }, timeout: TIMEOUT_MS },
+  ))
   return res.data
 }
 
-async function gapScrapeWithToken(token: string, initiativeId: string, state: ScrapeState): Promise<ScrapeResult> {
-  let pagesScraped = 0
-  let totalRecords = 0
-  let latestTotalElements = state.total_elements
+// Fetches a page and stores it. Every page this touches counts toward progress,
+// including search probes — the probes are not wasted requests.
+async function fetchAndStore(s: Session, page: number): Promise<PageResponse> {
+  const data = await fetchPage(s.token, page)
+  s.pagesFetched++
+  s.totalPages = data.totalPages
+  s.totalElements = data.totalElements
 
-  const scraped = await getScrapedCount(initiativeId)
-  const missing = latestTotalElements - scraped
-
-  // Missing votes were added to the initiative while the initial scrape was running.
-  // Because the API sorts newest-first, those votes landed on page 0 and pushed
-  // everything else down — so we never revisited them. They are now at the very
-  // beginning of the pagination. Scan only as many pages as needed to cover them.
-  const pagesToScan = Math.ceil(missing / 12) + 2   // +2 page buffer
-  console.log(`[gap-scan] missing ${missing} records — scanning pages 0–${pagesToScan - 1}`)
-
-  for (let page = 0; page < pagesToScan; page++) {
-    try {
-      const data = await fetchPage(token, page)
-      pagesScraped++
-      latestTotalElements = data.totalElements
-      const inserted = await upsertVotes(initiativeId, data.content)
-      totalRecords += inserted
-      console.log(`[gap-scan] page ${page}: ${inserted} new`)
-
-      await updateScrapeState(initiativeId, { last_scraped_at: new Date().toISOString() })
-    } catch (err: any) {
-      return await handleScrapeError(err, initiativeId, pagesScraped, totalRecords, page)
-    }
-  }
-
-  // After scanning, check actual count against what the API reports now.
-  const finalScraped = await getScrapedCount(initiativeId)
-  console.log(`[gap-scan] done — have ${finalScraped}/${latestTotalElements}`)
-
-  await updateScrapeState(initiativeId, {
-    is_initial_done: true,
-    total_elements: latestTotalElements,
-    last_scraped_at: new Date().toISOString(),
-  })
-
-  return { pagesScraped, totalRecords, lastPage: pagesToScan - 1, stoppedReason: 'done' }
+  const inserted = await upsertVotes(s.initiativeId, data.content ?? [])
+  s.newRecords += inserted
+  console.log(`[scraper] page ${page}: ${inserted} new / ${data.content?.length ?? 0} on page`)
+  return data
 }
 
-async function handleScrapeError(
-  err: any,
-  initiativeId: string,
-  pagesScraped: number,
-  totalRecords: number,
-  page: number,
-): Promise<ScrapeResult> {
-  const status = err.response?.status
-  if (status === 410 || status === 411) {
-    const now = new Date()
-    const updates: any = { current_page: page, last_scraped_at: now.toISOString() }
-    if (status === 411) {
-      console.log(`Initiative ${initiativeId} frozen (411)`)
-      updates.frozen_until = new Date(now.getTime() + 10 * 60 * 1000).toISOString()
+/**
+ * Finds the lowest page index whose oldest vote is at or older than `floor` — the
+ * page an interrupted run stopped on. Pages are sorted newest-first, so
+ * oldestOnPage decreases monotonically as the index grows, which is what makes the
+ * search valid.
+ *
+ * `hint` is the page index recorded when the run stopped. Votes cast since then
+ * shift content toward higher indices, so the true boundary is usually within a
+ * page or two of the hint. Galloping outward from it brackets the boundary in ~2
+ * probes instead of the ~7 a full-range binary search costs, and every probe saved
+ * is a page of real progress bought back from the 20-page budget.
+ */
+async function findResumePage(s: Session, floor: string, hint: number | null): Promise<number> {
+  const maxPage = Math.max(0, s.totalPages - 1)
+  if (maxPage === 0) return 0
+
+  // True when page p has reached at or past the floor, i.e. the boundary is <= p.
+  const reached = async (p: number): Promise<boolean> => {
+    const data = await fetchAndStore(s, p)
+    s.searchFetches++
+    const oldest = oldestOnPage(data.content ?? [])
+    // An empty page lies past the end of the data, so the boundary precedes it.
+    return oldest === null || oldest <= floor
+  }
+
+  let lo = 0
+  let hi = maxPage
+
+  if (hint !== null && hint > 0 && hint <= maxPage) {
+    let step = 1
+    if (await reached(hint)) {
+      // Boundary at or before the hint — gallop left.
+      hi = hint
+      let p = hint
+      while (p > 0) {
+        const next = Math.max(0, p - step)
+        if (!(await reached(next))) {
+          lo = next + 1
+          break
+        }
+        hi = next
+        p = next
+        step *= 2
+      }
     } else {
-      console.log(`Token expired for initiative ${initiativeId} (410)`)
-      updates.frozen_until = null
-    }
-    await updateScrapeState(initiativeId, updates)
-    return {
-      pagesScraped, totalRecords, lastPage: page,
-      stoppedReason: 'expired',
-      errorMessage: status === 411 ? 'Rate limited — frozen for 10 minutes' : 'Token expired — ready for new captcha',
+      // Boundary after the hint — gallop right.
+      lo = hint + 1
+      let p = hint
+      while (p < maxPage) {
+        const next = Math.min(maxPage, p + step)
+        if (await reached(next)) {
+          hi = next
+          break
+        }
+        lo = next + 1
+        p = next
+        step *= 2
+      }
     }
   }
-  console.error('Gap scan error:', err.message)
-  return { pagesScraped, totalRecords, lastPage: page, stoppedReason: 'error', errorMessage: err.message }
+
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if (await reached(mid)) hi = mid
+    else lo = mid + 1
+  }
+
+  console.log(`[scraper] resume page ${lo} (floor ${floor}, hint ${hint}, ${s.searchFetches} probes)`)
+  return lo
 }
 
-// Marks initial scrape as done only if count matches total.
-// If records are missing, queues gap scan instead of marking done.
-async function markInitialDone(initiativeId: string, totalElements: number): Promise<void> {
-  const scraped = await getScrapedCount(initiativeId)
-  if (scraped >= totalElements) {
-    await updateScrapeState(initiativeId, { is_initial_done: true, total_elements: totalElements })
-    console.log(`[scraper] ${initiativeId} marked initial done (${scraped}/${totalElements})`)
-  } else {
-    // Missing records — update total_elements from API and queue gap scan.
-    // Gap scan will confirm whether records are truly missing or gone from the API.
-    await updateScrapeState(initiativeId, { current_page: GAP_SCAN_SENTINEL, total_elements: totalElements })
-    console.log(`[scraper] ${initiativeId} queued for gap scan — missing ${totalElements - scraped} records (${scraped}/${totalElements})`)
+function result(s: Session, lastPage: number, reason: ScrapeResult['stoppedReason'], errorMessage?: string): ScrapeResult {
+  return {
+    pagesScraped: s.pagesFetched,
+    totalRecords: s.newRecords,
+    searchFetches: s.searchFetches,
+    lastPage,
+    stoppedReason: reason,
+    errorMessage,
   }
+}
+
+/**
+ * A run covers a contiguous band from `top` (the newest vote when the run began)
+ * down to wherever it finished. Votes cast during the run sit above `top` and are
+ * not part of that band, so the watermark advances only to `top`, never to the
+ * newest row in the table. The next catch-up picks up the remainder, which keeps
+ * coverage genuinely gap-free instead of merely looking complete.
+ */
+async function completeRun(s: Session, lastPage: number, top: string | null, markInitialDone: boolean): Promise<ScrapeResult> {
+  const watermark = top ?? await getNewestVoteDate(s.initiativeId)
+  await updateScrapeState(s.initiativeId, {
+    coverage_newest: watermark,
+    catchup_floor: null,
+    catchup_top: null,
+    current_page: lastPage,
+    total_elements: s.totalElements,
+    total_pages: s.totalPages,
+    last_scraped_at: new Date().toISOString(),
+    ...(markInitialDone ? { is_initial_done: true } : {}),
+  })
+  console.log(`[scraper] ${s.initiativeId} run complete — watermark ${watermark}`)
+  return result(s, lastPage, 'done')
+}
+
+async function handleError(s: Session, err: any, page: number): Promise<ScrapeResult> {
+  const status = err.response?.status
+  if (status !== 410 && status !== 411) {
+    console.error('[scraper] error:', err.message)
+    return result(s, page, 'error', err.message)
+  }
+
+  const now = new Date()
+  // 411 — page budget spent, initiative frozen. 410 — token expired, no freeze.
+  const frozen = status === 411
+  await updateScrapeState(s.initiativeId, {
+    current_page: page,
+    last_scraped_at: now.toISOString(),
+    frozen_until: frozen ? new Date(now.getTime() + 10 * 60 * 1000).toISOString() : null,
+  })
+  console.log(`[scraper] ${s.initiativeId} stopped at page ${page} (${status})`)
+
+  return result(s, page, 'expired', frozen
+    ? 'Rate limited — frozen for 10 minutes'
+    : 'Token expired — ready for new captcha')
 }
 
 export async function scrapeWithToken(token: string, initiativeId: string): Promise<ScrapeResult> {
   const state = await getScrapeState(initiativeId)
   if (!state) {
-    return { pagesScraped: 0, totalRecords: 0, lastPage: 0, stoppedReason: 'error', errorMessage: 'Initiative not found in scrape_state' }
-  }
-
-  if (!state.is_initial_done && state.current_page === GAP_SCAN_SENTINEL) {
-    return gapScrapeWithToken(token, initiativeId, state)
-  }
-
-  const isInitialDone = state.is_initial_done
-  let currentPage = isInitialDone ? 0 : state.current_page
-  let pagesScraped = 0
-  let totalRecords = 0
-
-  while (true) {
-    try {
-      const data = await fetchPage(token, currentPage)
-
-      // Update total info from API on first page
-      if (pagesScraped === 0) {
-        await updateScrapeState(initiativeId, {
-          total_elements: data.totalElements,
-          total_pages: data.totalPages,
-          last_scraped_at: new Date().toISOString(),
-        })
-      }
-
-      if (!data.content || data.content.length === 0) {
-        if (!isInitialDone) {
-          await markInitialDone(initiativeId, data.totalElements)
-        }
-        return { pagesScraped, totalRecords, lastPage: currentPage, stoppedReason: 'done' }
-      }
-
-      const inserted = await upsertVotes(initiativeId, data.content)
-
-      console.log(`Page ${currentPage} → ${inserted} new / ${data.content.length} total`)
-
-      totalRecords += inserted
-      pagesScraped++
-
-      // Catch-up mode: stop when a full page has 0 new records
-      if (isInitialDone && inserted === 0) {
-        return { pagesScraped, totalRecords, lastPage: currentPage, stoppedReason: 'done' }
-      }
-
-      // Initial mode: update current_page in DB
-      if (!isInitialDone) {
-        currentPage++
-        await updateScrapeState(initiativeId, {
-          current_page: currentPage,
-          last_scraped_at: new Date().toISOString(),
-        })
-
-        // Check if we reached the end
-        if (data.last || currentPage >= data.totalPages) {
-          await markInitialDone(initiativeId, data.totalElements)
-          return { pagesScraped, totalRecords, lastPage: currentPage, stoppedReason: 'done' }
-        }
-      } else {
-        currentPage++
-      }
-    } catch (err: any) {
-      const status = err.response?.status
-      if (status === 410 || status === 411) {
-        const now = new Date()
-        const updates: any = { last_scraped_at: now.toISOString() }
-
-        if (status === 411) {
-          // limit hit, 10 min not passed — set frozen
-          console.log(`Initiative ${initiativeId} frozen (411)`)
-          updates.frozen_until = new Date(now.getTime() + 10 * 60 * 1000).toISOString()
-        } else {
-          // 410 — 10 min passed, token expired, clear freeze
-          console.log(`Token expired for initiative ${initiativeId} (410)`)
-          updates.frozen_until = null
-        }
-
-        await updateScrapeState(initiativeId, updates)
-        return {
-          pagesScraped, totalRecords, lastPage: currentPage,
-          stoppedReason: 'expired',
-          errorMessage: status === 411 ? 'Rate limited — frozen for 10 minutes' : 'Token expired — ready for new captcha',
-        }
-      }
-
-      console.error('Scrape error:', err.message)
-      return {
-        pagesScraped, totalRecords, lastPage: currentPage,
-        stoppedReason: 'error', errorMessage: err.message,
-      }
+    return {
+      pagesScraped: 0, totalRecords: 0, searchFetches: 0, lastPage: 0,
+      stoppedReason: 'error', errorMessage: 'Initiative not found in scrape_state',
     }
+  }
+
+  const s: Session = {
+    token, initiativeId,
+    pagesFetched: 0, newRecords: 0, searchFetches: 0,
+    totalPages: state.total_pages || 1,
+    totalElements: state.total_elements || 0,
+  }
+
+  // A backfill has never reached the bottom of the list, so it can only finish by
+  // getting there. A catch-up finishes as soon as it reaches covered territory.
+  const isBackfill = !state.is_initial_done
+  const watermark = state.coverage_newest ? normalizeDate(state.coverage_newest) : null
+  const floor = state.catchup_floor ? normalizeDate(state.catchup_floor) : null
+  const resuming = floor !== null
+
+  let page = 0
+  try {
+    // Page 0 always runs: it carries the newest votes and refreshes totalPages,
+    // which the resume search needs as its upper bound.
+    const first = await fetchAndStore(s, 0)
+    const content = first.content ?? []
+
+    // Fix the band's top on the first session of a run and carry it across resumes.
+    const top = resuming
+      ? (state.catchup_top ? normalizeDate(state.catchup_top) : newestOnPage(content))
+      : newestOnPage(content)
+
+    await updateScrapeState(initiativeId, {
+      total_elements: s.totalElements,
+      total_pages: s.totalPages,
+      catchup_top: top,
+      last_scraped_at: new Date().toISOString(),
+    })
+
+    if (content.length === 0 || first.last || s.totalPages <= 1) {
+      return completeRun(s, 0, top, isBackfill)
+    }
+
+    const firstOldest = oldestOnPage(content)
+    if (!isBackfill && !resuming && watermark && firstOldest && firstOldest < watermark) {
+      return completeRun(s, 0, top, false)
+    }
+
+    // Resume an interrupted run at the page it died on rather than re-walking to it.
+    page = resuming ? Math.max(1, await findResumePage(s, floor as string, state.current_page)) : 1
+
+    let overshoot = OVERSHOOT_PAGES
+    while (page < s.totalPages) {
+      const data = await fetchAndStore(s, page)
+      const rows = data.content ?? []
+      if (rows.length === 0) return completeRun(s, page, top, isBackfill)
+
+      const oldest = oldestOnPage(rows)
+      // Persist the floor every page so a 411 mid-run costs nothing but the search.
+      await updateScrapeState(initiativeId, {
+        catchup_floor: oldest,
+        current_page: page,
+        last_scraped_at: new Date().toISOString(),
+      })
+
+      if (data.last || page >= s.totalPages - 1) return completeRun(s, page, top, isBackfill)
+
+      if (!isBackfill && watermark && oldest && oldest < watermark) {
+        if (overshoot === 0) return completeRun(s, page, top, false)
+        overshoot--
+      }
+      page++
+    }
+
+    return completeRun(s, page, top, isBackfill)
+  } catch (err: any) {
+    return handleError(s, err, page)
   }
 }

@@ -1,8 +1,10 @@
 import axios from 'axios'
 import { config } from '../config'
 import { InitiativeTokenResponse } from '../types'
+import { withRetry } from './retry'
 
 const API_BASE = 'https://openbudget.uz/api/v2'
+const TIMEOUT_MS = 15000
 
 const authHeaders = () => ({
   Authorization: `Bearer ${config.apiToken}`,
@@ -10,9 +12,10 @@ const authHeaders = () => ({
 })
 
 export async function fetchCaptcha(): Promise<{ image: Buffer; captchaKey: string }> {
-  const res = await axios.get(`${API_BASE}/vote/captcha-2`, {
+  const res = await withRetry('fetchCaptcha', () => axios.get(`${API_BASE}/vote/captcha-2`, {
     headers: authHeaders(),
-  })
+    timeout: TIMEOUT_MS,
+  }))
 
   const base64: string = res.data.image
   const cleaned = base64.replace(/^data:image\/\w+;base64,/, '')
@@ -28,13 +31,16 @@ export async function fetchInitiativeToken(
   captchaKey: string,
   captchaResult: string,
 ): Promise<InitiativeTokenResponse> {
-  const res = await axios.post(`${API_BASE}/info/get-initiative-token`, {
+  // Not retried on 4xx: a wrong captcha answer must surface immediately, and the
+  // captchaKey is single-use so repeating it would fail anyway.
+  const res = await withRetry('fetchInitiativeToken', () => axios.post(`${API_BASE}/info/get-initiative-token`, {
     initiativeId,
     captchaKey,
     captchaResult,
   }, {
     headers: authHeaders(),
-  })
+    timeout: TIMEOUT_MS,
+  }))
 
   return res.data
 }

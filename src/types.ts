@@ -7,6 +7,14 @@ export interface ScrapeState {
   is_initial_done: boolean
   last_scraped_at: string | null
   frozen_until: string | null
+  // Newest vote covered by a contiguous block reaching down to the oldest vote.
+  // A catch-up run stops once it reaches this point.
+  coverage_newest: string | null
+  // Oldest vote fetched by a run that was cut short. Null when no run is pending.
+  catchup_floor: string | null
+  // Newest vote at the moment the pending run began. The run's covered band is
+  // (catchup_floor, catchup_top]; votes above it arrived mid-run and stay uncovered.
+  catchup_top: string | null
   created_at: string
 }
 
@@ -27,6 +35,8 @@ export interface PageResponse {
 export interface ScrapeResult {
   pagesScraped: number
   totalRecords: number
+  // Pages spent locating the resume point rather than making forward progress.
+  searchFetches: number
   lastPage: number
   stoppedReason: 'expired' | 'done' | 'error'
   errorMessage?: string

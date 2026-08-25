@@ -41,9 +41,13 @@ export function registerScrapeHandler(bot: TelegramBot) {
       await bot.deleteMessage(chatId, loadingMsg.message_id)
 
       pendingCaptchas.set(chatId, { captchaKey, initiativeId: initiative.initiative_id })
-    } catch (error) {
-      console.error(error)
-      await bot.sendMessage(chatId, 'Failed to load captcha')
+    } catch (error: any) {
+      const reason = error.response?.status
+        ?? error.code
+        ?? error.cause?.code
+        ?? error.message
+      console.error('Captcha load failed:', reason, error.message)
+      await bot.sendMessage(chatId, `Failed to load captcha (${reason}). Send /scrape to try again.`)
     }
   })
 
@@ -64,33 +68,36 @@ export function registerScrapeHandler(bot: TelegramBot) {
         getScrapedCount(pending.initiativeId),
         getScrapeState(pending.initiativeId),
       ])
-      const isGapScan = state && !state.is_initial_done && state.current_page === -1
-      const isCatchUp = state?.is_initial_done === true
+
       let startMsg: string
-      if (isGapScan) {
-        startMsg = `Token received. Gap scan: scanning early pages for missing records... (${scraped}/${state?.total_elements ?? '?'} in DB)`
-      } else if (isCatchUp) {
-        startMsg = `Token received. Catch-up: scanning from page 0 for new votes... (${scraped} records in DB)`
+      if (state?.catchup_floor) {
+        startMsg = `Token received. Resuming interrupted run — binary searching for the resume page...`
+      } else if (state && !state.is_initial_done) {
+        startMsg = `Token received. Backfill from page ${state.current_page}...`
+      } else if (state && !state.coverage_newest) {
+        startMsg = `Token received. Full re-verify — walking every page...`
       } else {
-        startMsg = `Token received. Scraping from page ${state?.current_page ?? 0}... (${scraped} records in DB)`
+        startMsg = `Token received. Catch-up for new votes...`
       }
-      await bot.sendMessage(chatId, startMsg)
+      await bot.sendMessage(chatId, `${startMsg} (${scraped} records in DB)`)
 
       const scrapeResult = await scrapeWithToken(result.token, pending.initiativeId)
 
       const lines = [
         `Scraping finished:`,
-        `Pages: ${scrapeResult.pagesScraped}`,
+        `Pages fetched: ${scrapeResult.pagesScraped}`,
         `New records: ${scrapeResult.totalRecords}`,
         `Stopped at page: ${scrapeResult.lastPage}`,
         `Reason: ${scrapeResult.stoppedReason}`,
       ]
+      if (scrapeResult.searchFetches > 0) {
+        lines.splice(2, 0, `Resume-search probes: ${scrapeResult.searchFetches}`)
+      }
       if (scrapeResult.errorMessage) {
         lines.push(`Error: ${scrapeResult.errorMessage}`)
       }
-      if (scrapeResult.stoppedReason === 'expired' || scrapeResult.stoppedReason === 'done') {
-        const allDone = scrapeResult.stoppedReason === 'done'
-        if (!allDone) lines.push('\nSend /scrape to continue with next initiative')
+      if (scrapeResult.stoppedReason === 'expired') {
+        lines.push('\nProgress saved. Send /scrape to resume where this left off.')
       }
 
       await bot.sendMessage(chatId, lines.join('\n'))
