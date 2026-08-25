@@ -65,11 +65,16 @@ export function registerScrapeHandler(bot: TelegramBot) {
         getScrapeState(pending.initiativeId),
       ])
       const isGapScan = state && !state.is_initial_done && state.current_page === -1
-      await bot.sendMessage(chatId,
-        isGapScan
-          ? `Token received. Gap scan: binary searching for missing pages... (${scraped}/${state?.total_elements ?? '?'} in DB)`
-          : `Token received. Scraping from page ${state?.current_page ?? 0}... (${scraped} records in DB)`
-      )
+      const isCatchUp = state?.is_initial_done === true
+      let startMsg: string
+      if (isGapScan) {
+        startMsg = `Token received. Gap scan: scanning early pages for missing records... (${scraped}/${state?.total_elements ?? '?'} in DB)`
+      } else if (isCatchUp) {
+        startMsg = `Token received. Catch-up: scanning from page 0 for new votes... (${scraped} records in DB)`
+      } else {
+        startMsg = `Token received. Scraping from page ${state?.current_page ?? 0}... (${scraped} records in DB)`
+      }
+      await bot.sendMessage(chatId, startMsg)
 
       const scrapeResult = await scrapeWithToken(result.token, pending.initiativeId)
 

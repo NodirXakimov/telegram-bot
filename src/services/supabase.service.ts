@@ -80,12 +80,13 @@ export async function updateScrapeState(
 export async function pickNextInitiative(): Promise<ScrapeState | null> {
   const now = new Date().toISOString()
 
-  // Get all unfrozen initiatives, prioritize incomplete initial scrapes, then least recently scraped
+  // Get all unfrozen initiatives. Incomplete initial scrapes come first (is_initial_done
+  // false sorts before true), then finished ones for catch-up, least recently scraped first.
   const { data, error } = await supabase
     .from('scrape_state')
     .select('*')
-    .eq('is_initial_done', false)
     .or(`frozen_until.is.null,frozen_until.lt.${now}`)
+    .order('is_initial_done', { ascending: true })
     .order('last_scraped_at', { ascending: true, nullsFirst: true })
     .limit(1)
 

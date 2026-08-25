@@ -2,7 +2,7 @@ import axios from 'axios'
 import { PageResponse, ScrapeResult, ScrapeState } from '../types'
 import { upsertVotes, updateScrapeState, getScrapeState, getScrapedCount } from './supabase.service'
 
-// Sentinel value stored in current_page to trigger binary-search gap scan
+// Sentinel value stored in current_page to trigger gap scan
 const GAP_SCAN_SENTINEL = -1
 const MAX_PAGES_PER_SESSION = 20
 
@@ -126,6 +126,7 @@ export async function scrapeWithToken(token: string, initiativeId: string): Prom
         await updateScrapeState(initiativeId, {
           total_elements: data.totalElements,
           total_pages: data.totalPages,
+          last_scraped_at: new Date().toISOString(),
         })
       }
 
